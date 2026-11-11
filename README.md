@@ -6,7 +6,7 @@
 
 Existing multi-FPGA system (MFS) partitioners mainly optimize cut size or net delay, but the true determinant of a circuit's clock frequency is the **critical path delay**. CODA tackles this with a novel **two-stage framework**:
 
-1. **Stage 1 — Resource-aware partitioning:** Reduces the I/O resource utilization of inter-FPGA interconnections.
+1. **Stage 1 — Resource-Conserving Initial Solution Generation:** Reduces the I/O resource utilization of inter-FPGA interconnections.
 2. **Stage 2 — Critical-path optimization:** Aggressively optimizes critical path delay to achieve low latency.
 
 Evaluated on the **Titan23** benchmark suite, CODA achieves a significant reduction in critical path delay compared to state-of-the-art methods.

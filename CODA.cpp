@@ -15,7 +15,13 @@
 #include <set>
 #include <map>
 
-int TDM_RATIO = 100;
+// Wire capacity c(e^F) of every inter-FPGA link.
+const int WIRE_CAPACITY = 50;
+// The delay of a link carrying s signals is its TDM ratio ceil(s / c(e^F))
+// rounded up to an even number, which equals 2 * ceil(s / (2 * c(e^F))).
+// Internally, all delays are kept as ceil(s / tmp_ratio), i.e., half of the
+// actual delay; reported critical path delays are multiplied by 2.
+const int tmp_ratio = 2 * WIRE_CAPACITY;
 
 struct FPGAGraph {
     int n, m;
@@ -90,14 +96,6 @@ struct PartitionResult {
     std::vector<int> fpga_used_weight;
     std::vector<std::vector<int>> d;
     std::unordered_map<int, std::vector<NetRoute>> r_star;
-};
-
-struct LevelData {
-    SNGraph sn_graph;
-    std::vector<SuperNode> supernodes;
-    int num_supernodes;
-    std::unordered_map<int, int> sn_mapping;
-    std::unordered_map<int, std::unordered_map<int, int>> net_mapping;
 };
 
 HyperGraph read_hypergraph(const std::string& hg_file, const std::string& ff_file) {
@@ -192,86 +190,6 @@ std::vector<int> compute_depth_initial(const HyperGraph& hg) {
     return depth;
 }
 
-static void print_supernode_members(int sn_id, const std::vector<SuperNode>& supernodes) {
-    std::cerr << "  SN" << sn_id << " [is_ff=" << supernodes[sn_id].is_ff
-              << ", weight=" << supernodes[sn_id].weight << "] original nodes: {";
-    bool first = true;
-    for (int orig : supernodes[sn_id].nodes) {
-        if (!first) std::cerr << ", ";
-        std::cerr << orig;
-        first = false;
-    }
-    std::cerr << "}\n";
-}
-
-std::unordered_map<int,int> compute_depth_supernodes(
-    const SNGraph& sn_graph,
-    const std::vector<SuperNode>& supernodes,
-    int num_supernodes)
-{
-    std::unordered_map<int, std::unordered_set<int>> adj;
-    std::unordered_map<int, int> indegree;
-    for (int i = 1; i <= num_supernodes; i++) indegree[i] = 0;
-    for (auto& pair : sn_graph) {
-        int sn_u = pair.first;
-        for (auto& net : pair.second) {
-            for (int sn_v : net.sinks) {
-                if (!adj[sn_u].count(sn_v)) {
-                    adj[sn_u].insert(sn_v);
-                    indegree[sn_v]++;
-                }
-            }
-        }
-    }
-    std::unordered_map<int, int> color;
-    std::unordered_map<int, int> parent;
-    for (int i = 1; i <= num_supernodes; i++) { color[i] = 0; parent[i] = -1; }
-    std::function<void(int)> dfs = [&](int u) {
-        color[u] = 1;
-        if (!adj.count(u)) { color[u] = 2; return; }
-        for (int v : adj[u]) {
-            if (supernodes[v].is_ff) continue;
-            if (color[v] == 1) {
-                std::cerr << "Error: cycle detected in supernode graph.\n";
-                exit(1);
-            }
-            if (color[v] == 0) {
-                parent[v] = u;
-                dfs(v);
-            }
-        }
-        color[u] = 2;
-    };
-    for (int i = 1; i <= num_supernodes; i++)
-        if (color[i] == 0 && !supernodes[i].is_ff)
-            dfs(i);
-    std::unordered_map<int,int> depth;
-    std::queue<int> q;
-    for (int i = 1; i <= num_supernodes; i++) {
-        if (supernodes[i].is_ff || indegree[i] == 0) {
-            depth[i] = 1;
-            q.push(i);
-        }
-    }
-    while (!q.empty()) {
-        int u = q.front(); q.pop();
-        if (!adj.count(u)) continue;
-        for (int v : adj[u]) {
-            if (supernodes[v].is_ff) continue;
-            depth[v] = std::max(depth[v], depth[u] + 1);
-            if (--indegree[v] == 0) q.push(v);
-        }
-    }
-    for (int i = 1; i <= num_supernodes; i++) {
-        if (!depth.count(i)) {
-            std::cerr << "Error: supernode " << i << " has no depth after BFS.\n";
-            print_supernode_members(i, supernodes);
-            exit(1);
-        }
-    }
-    return depth;
-}
-
 std::vector<SuperNode> build_initial_supernodes(const HyperGraph& hg) {
     std::vector<SuperNode> supernodes(hg.n + 1);
     for (int i = 1; i <= hg.n; i++) {
@@ -294,168 +212,6 @@ SNGraph build_initial_sn_graph(const HyperGraph& hg) {
         g[driver].push_back(net);
     }
     return g;
-}
-
-std::unordered_map<int, std::unordered_map<int,int>> build_prio_graph(const SNGraph& sn_graph) {
-    std::unordered_map<int, std::unordered_map<int,int>> prio_graph;
-    for (auto& pair : sn_graph) {
-        int sn_u = pair.first;
-        for (auto& net : pair.second) {
-            for (int sn_v : net.sinks) {
-                if (sn_u == sn_v) continue;
-                prio_graph[sn_u][sn_v] += net.weight;
-            }
-        }
-    }
-    return prio_graph;
-}
-
-struct CoarsenResult {
-    SNGraph new_sn_graph;
-    std::vector<SuperNode> new_supernodes;
-    std::unordered_map<int,int> sn_mapping;
-    std::unordered_map<int, std::unordered_map<int, int>> net_mapping;
-    int num_supernodes;
-};
-
-CoarsenResult coarsen_one_level(
-    const SNGraph& sn_graph,
-    const std::vector<SuperNode>& supernodes,
-    int num_supernodes,
-    const std::vector<int>& placed_on_sn,
-    int capacity = INT_MAX)
-{
-    auto prio_graph = build_prio_graph(sn_graph);
-    std::unordered_map<int, std::unordered_set<int>> preds, succs;
-    for (auto& u_pair : prio_graph) {
-        int u = u_pair.first;
-        for (auto& v_pair : u_pair.second) {
-            int v = v_pair.first;
-            preds[v].insert(u);
-            succs[u].insert(v);
-        }
-    }
-    std::vector<std::tuple<double,int,int>> prio_list;
-    for (auto& u_pair : prio_graph) {
-        int sn_u = u_pair.first;
-        for (auto& v_pair : u_pair.second) {
-            int sn_v = v_pair.first;
-            int w = v_pair.second;
-            const SuperNode& su = supernodes[sn_u];
-            const SuperNode& sv = supernodes[sn_v];
-            if (placed_on_sn[sn_u] != placed_on_sn[sn_v]) continue;
-            if (su.is_ff != sv.is_ff) continue;
-            if (!su.is_ff) {
-                auto it = succs.find(sn_u);
-                if (it == succs.end() || it->second.size() != 1) continue;
-            }
-            double p = (double)w / ((double)su.weight * sv.weight);
-            prio_list.push_back({p, sn_u, sn_v});
-        }
-    }
-    std::sort(prio_list.begin(), prio_list.end(),
-        [](const auto& a, const auto& b){ return std::get<0>(a) > std::get<0>(b); });
-
-    std::vector<int>  cur_weight(num_supernodes + 1);
-    std::vector<bool> cur_is_ff (num_supernodes + 1);
-    std::unordered_set<int> merged_nodes;
-    std::unordered_map<int,int> absorbed_by;
-
-    for (int i = 1; i <= num_supernodes; i++) {
-        cur_weight[i] = supernodes[i].weight;
-        cur_is_ff[i]  = supernodes[i].is_ff;
-    }
-    auto rep = [&](int i) {
-        auto it = absorbed_by.find(i);
-        return it != absorbed_by.end() ? it->second : i;
-    };
-    std::unordered_set<int> locked_nodes;
-
-    for (auto& tup : prio_list) {
-        int sn_u = std::get<1>(tup);
-        int sn_v = std::get<2>(tup);
-        if (locked_nodes.count(sn_u) || locked_nodes.count(sn_v)) continue;
-        if (cur_weight[sn_u] + cur_weight[sn_v] > capacity) continue;
-
-        if (!cur_is_ff[sn_u]) {
-            auto it = succs.find(sn_u);
-            if (it == succs.end() || it->second.size() != 1) continue;
-            if (*it->second.begin() != sn_v) continue;
-        }
-
-        for (int s : succs[sn_v]) succs[sn_u].insert(s);
-        succs[sn_u].erase(sn_v);
-        for (int p : preds[sn_v]) preds[sn_u].insert(p);
-        preds[sn_u].erase(sn_v);
-        for (int p : preds[sn_u]) {
-            if (p == sn_u) continue;
-            auto it = succs.find(p);
-            if (it != succs.end() && it->second.erase(sn_v)) {
-                it->second.insert(sn_u);
-            }
-        }
-        for (int s : succs[sn_u]) {
-            if (s == sn_u) continue;
-            auto it = preds.find(s);
-            if (it != preds.end() && it->second.erase(sn_v)) {
-                it->second.insert(sn_u);
-            }
-        }
-
-        locked_nodes.insert(sn_u);
-        locked_nodes.insert(sn_v);
-        merged_nodes.insert(sn_v);
-        absorbed_by[sn_v] = sn_u;
-        cur_weight[sn_u] += cur_weight[sn_v];
-    }
-
-    std::unordered_map<int,int> old_to_new_id;
-    std::vector<SuperNode> new_supernodes;
-    new_supernodes.push_back({});
-    int new_id = 1;
-    for (int i = 1; i <= num_supernodes; i++) {
-        if (merged_nodes.count(i)) continue;
-        old_to_new_id[i] = new_id;
-        SuperNode new_sn;
-        new_sn.id     = new_id;
-        new_sn.is_ff  = cur_is_ff[i];
-        new_sn.weight = cur_weight[i];
-        new_supernodes.push_back(new_sn);
-        new_id++;
-    }
-    for (int i = 1; i <= num_supernodes; i++) {
-        int new_rep_id = old_to_new_id[rep(i)];
-        for (int orig_node : supernodes[i].nodes)
-            new_supernodes[new_rep_id].nodes.insert(orig_node);
-    }
-    std::unordered_map<int,int> sn_mapping;
-    for (int i = 1; i <= num_supernodes; i++)
-        sn_mapping[i] = old_to_new_id[rep(i)];
-
-    SNGraph new_sn_graph;
-    std::unordered_map<int, std::unordered_map<int, int>> net_mapping;
-
-    for (auto& pair : sn_graph) {
-        int sn_u = pair.first;
-        int new_u = sn_mapping[sn_u];
-        int fine_net_idx = 0;
-        for (auto& net : pair.second) {
-            Net new_net;
-            new_net.weight = net.weight;
-            for (int sn_v : net.sinks) {
-                int new_v = sn_mapping[sn_v];
-                if (new_v == new_u) continue;
-                new_net.sinks.insert(new_v);
-            }
-            if (!new_net.sinks.empty()) {
-                int coarse_net_idx = new_sn_graph[new_u].size();
-                new_sn_graph[new_u].push_back(new_net);
-                net_mapping[sn_u][fine_net_idx] = coarse_net_idx;
-            }
-            fine_net_idx++;
-        }
-    }
-    return {new_sn_graph, new_supernodes, sn_mapping, net_mapping, new_id - 1};
 }
 
 std::vector<int> read_partition(const std::string& filename, int n) {
@@ -682,7 +438,7 @@ PartitionResult initial_partitioning(
     }
 
     int hedge_count = hedges.size();
-    std::string aug_path = "/tmp/coarsest_hmetis.hgr";
+    std::string aug_path = "/tmp/coda_kahypar.hgr";
     {
         std::ofstream fout(aug_path);
         fout << hedge_count << " " << num_supernodes << " 10\n";
@@ -954,66 +710,6 @@ PartitionResult initial_partitioning(
     return res;
 }
 
-PartitionResult project_result_to_coarse(
-    const SNGraph& fine_sn_graph,
-    int fine_num_supernodes,
-    const std::unordered_map<int,int>& sn_mapping,
-    const std::unordered_map<int, std::unordered_map<int, int>>& net_mapping,
-    const PartitionResult& fine_res)
-{
-    PartitionResult coarse_res;
-    coarse_res.fpga_used_weight = fine_res.fpga_used_weight;
-    coarse_res.d = fine_res.d;
-
-    for (int i = 1; i <= fine_num_supernodes; ++i) {
-        int p = sn_mapping.at(i);
-        if (!coarse_res.placed_on.count(p)) {
-            coarse_res.placed_on[p] = fine_res.placed_on.at(i);
-        }
-    }
-
-    std::vector<int> fine_drivers;
-    fine_drivers.reserve(fine_sn_graph.size());
-    for (const auto& kv : fine_sn_graph) fine_drivers.push_back(kv.first);
-    std::sort(fine_drivers.begin(), fine_drivers.end());
-
-    for (int u : fine_drivers) {
-        const auto& fine_nets = fine_sn_graph.at(u);
-        int coarse_u = sn_mapping.at(u);
-        auto it_u_map = net_mapping.find(u);
-        const auto& fine_routes = fine_res.r_star.at(u);
-
-        for (int ni = 0; ni < (int)fine_nets.size(); ++ni) {
-            if (it_u_map == net_mapping.end() ||
-                it_u_map->second.find(ni) == it_u_map->second.end()) {
-                continue;
-            }
-            int coarse_ni = it_u_map->second.at(ni);
-            const NetRoute& fine_nr = fine_routes[ni];
-
-            NetRoute coarse_nr;
-            coarse_nr.driver = coarse_u;
-            coarse_nr.weight = fine_nr.weight;
-
-            std::unordered_set<int> seen;
-            for (int v : fine_nr.sinks) {
-                int coarse_v = sn_mapping.at(v);
-                if (coarse_v == coarse_u) continue;
-                if (seen.insert(coarse_v).second) {
-                    coarse_nr.sinks.push_back(coarse_v);
-                    coarse_nr.sink_paths[coarse_v] = fine_nr.sink_paths.at(v);
-                }
-            }
-
-            auto& vec = coarse_res.r_star[coarse_u];
-            if ((int)vec.size() <= coarse_ni) vec.resize(coarse_ni + 1);
-            vec[coarse_ni] = coarse_nr;
-        }
-    }
-
-    return coarse_res;
-}
-
 int compute_critical_path_delay(
     const SNGraph& sn_graph,
     const std::vector<SuperNode>& supernodes,
@@ -1031,7 +727,7 @@ int compute_critical_path_delay(
                     for (size_t k = 0; k < path.size() - 1; ++k) {
                         int a = path[k];
                         int b = path[k+1];
-                        dly += (int)std::ceil((double)part_result.d[a][b] / (double)TDM_RATIO);
+                        dly += (int)std::ceil((double)part_result.d[a][b] / (double)tmp_ratio);
                     }
                 }
                 pair_delay[nr.driver][sink] = std::max(pair_delay[nr.driver][sink], dly);
@@ -1077,7 +773,7 @@ int compute_critical_path_delay(
             }
         }
     }
-    if (!quiet) std::cout << "Max Critical Path Delay: " << max_critical_delay << "\n";
+    if (!quiet) std::cout << "Max Critical Path Delay: " << 2 * max_critical_delay << "\n";
     return max_critical_delay;
 }
 
@@ -1127,7 +823,7 @@ static inline int path_delay(const std::vector<int>& path,
     if (path.size() <= 1) return 0;
     int dly = 0;
     for (size_t k = 0; k + 1 < path.size(); ++k)
-        dly += (int)std::ceil((double)d[path[k]][path[k+1]] / (double)TDM_RATIO);
+        dly += (int)std::ceil((double)d[path[k]][path[k+1]] / (double)tmp_ratio);
     return dly;
 }
 
@@ -1524,7 +1220,7 @@ static CeilDSnapshot snapshot_ceil_d(const std::vector<std::vector<int>>& d, int
     for (int i = 0; i < n; ++i)
         for (int j = i + 1; j < n; ++j)
             if (d[i][j] > 0)
-                snap.ceils[{i, j}] = (int)std::ceil((double)d[i][j] / (double)TDM_RATIO);
+                snap.ceils[{i, j}] = (int)std::ceil((double)d[i][j] / (double)tmp_ratio);
     return snap;
 }
 
@@ -1535,7 +1231,7 @@ static bool ceil_d_unchanged(
 {
     for (int i = 0; i < n; ++i) {
         for (int j = i + 1; j < n; ++j) {
-            int now = (d_after[i][j] > 0) ? (int)std::ceil((double)d_after[i][j] / (double)TDM_RATIO) : 0;
+            int now = (d_after[i][j] > 0) ? (int)std::ceil((double)d_after[i][j] / (double)tmp_ratio) : 0;
             int was = 0;
             auto it = before.ceils.find({i, j});
             if (it != before.ceils.end()) was = it->second;
@@ -1563,7 +1259,7 @@ PartitionResult refine_partitioning(
     auto node_nets = build_node_to_nets(current_res);
 
     int current_max_delay = sta.max_delay;
-    std::cout << "[ECO] Start Refinement. Initial Delay: " << current_max_delay
+    std::cout << "[ECO] Start Refinement. Initial Delay: " << 2 * current_max_delay
               << " | Rounds: " << max_rounds
               << " | MaxFailStreak: " << max_fail_streak << "\n";
 
@@ -1722,7 +1418,7 @@ PartitionResult refine_partitioning(
                             if (cost > dj_dist[u]) continue;
                             if (reached_fpgas.count(u)) { meet_node = u; break; }
                             for (int v : graph.adj[u]) {
-                                long long w = (long long)std::ceil((double)(temp_d[u][v] + 1) / (double)TDM_RATIO);
+                                long long w = (long long)std::ceil((double)(temp_d[u][v] + 1) / (double)tmp_ratio);
                                 if (dj_dist[u] + w < dj_dist[v]) {
                                     dj_dist[v] = dj_dist[u] + w;
                                     dj_parent[v] = u;
@@ -1769,7 +1465,7 @@ PartitionResult refine_partitioning(
                                 if (closest_nodes.count(u)) { meet_node = u; break; }
                                 for (int v : graph.adj[u]) {
                                     if (graph.dist[snk_fpga][v] == graph.dist[snk_fpga][u] + 1) {
-                                        long long w = (long long)std::ceil((double)(temp_d[u][v] + 1) / (double)TDM_RATIO);
+                                        long long w = (long long)std::ceil((double)(temp_d[u][v] + 1) / (double)tmp_ratio);
                                         if (sp_cost[u] + w < sp_cost[v]) {
                                             sp_cost[v] = sp_cost[u] + w;
                                             sp_parent[v] = u;
@@ -1863,8 +1559,8 @@ PartitionResult refine_partitioning(
         if (new_max_delay < current_max_delay) {
             std::cout << "  Round " << round + 1
                       << " [" << (fast_ok ? "INC" : "FULL") << "]"
-                      << ": Accept! Delay " << current_max_delay
-                      << " -> " << new_max_delay << "\n";
+                      << ": Accept! Delay " << 2 * current_max_delay
+                      << " -> " << 2 * new_max_delay << "\n";
             current_max_delay = new_max_delay;
             backup_res = current_res;
             backup_sta = sta;
@@ -1873,8 +1569,8 @@ PartitionResult refine_partitioning(
             fail_streak++;
             std::cout << "  Round " << round + 1
                       << " [" << (fast_ok ? "INC" : "FULL") << "]"
-                      << ": No improvement (new=" << new_max_delay
-                      << " >= best=" << current_max_delay << "). fail_streak="
+                      << ": No improvement (new=" << 2 * new_max_delay
+                      << " >= best=" << 2 * current_max_delay << "). fail_streak="
                       << fail_streak << "/" << max_fail_streak << "\n";
             if (fail_streak >= max_fail_streak) {
                 std::cout << "  Round " << round + 1 << ": fail_streak limit, stop.\n";
@@ -1919,7 +1615,7 @@ int main(int argc, char* argv[]) {
             initial_2pin_nets += net.sinks.size();
         }
     }
-    std::cout << "[Info] Total 2-pin nets in initial flat sn_graph: " << initial_2pin_nets << "\n";
+    std::cout << "[Info] Total driver-sink pairs: " << initial_2pin_nets << "\n";
 
     FPGAGraph graph;
     if (!graph.load("./dataset/FPGA_Graph/MFS2")) {
@@ -1931,250 +1627,29 @@ int main(int argc, char* argv[]) {
     std::cout<<"FPGA capacity:"<<FPGA_capacity<<std::endl;
 
     std::clock_t start_time = std::clock();
-
     std::cout << "\n==================================================\n";
-    std::cout << "STEP 1: Initial Partitioning on FLAT graph (hmetis sees full graph)\n";
+    std::cout << "STAGE 1: Initial Solution Generation (partitioning + routing)\n";
     std::cout << "==================================================\n";
-    PartitionResult flat_part_result = initial_partitioning(
+    PartitionResult init_res = initial_partitioning(
         sn_graph, supernodes, num_supernodes, graph, FPGA_capacity);
 
-    int flat_init_delay = compute_critical_path_delay(
-        sn_graph, supernodes, num_supernodes, flat_part_result);
-    std::cout << "[Info] Initial delay on FLAT graph: " << flat_init_delay << "\n";
+    int init_delay = compute_critical_path_delay(
+        sn_graph, supernodes, num_supernodes, init_res);
+    std::cout << "[Info] Initial critical path delay: " << 2 * init_delay << "\n";
 
     std::cout << "\n==================================================\n";
-    std::cout << "STEP 2: Coarsen (only same-FPGA nodes can be merged)\n";
+    std::cout << "STAGE 2: Criticality-Driven Refinement\n";
     std::cout << "==================================================\n";
+    PartitionResult current_res = refine_partitioning(
+        sn_graph, supernodes, num_supernodes, graph, FPGA_capacity, init_res, 500);
 
-    std::vector<LevelData> hierarchy;
-    PartitionResult current_res = flat_part_result;
-
-    int stop_threshold = 30;
-    int level = 0;
-
-    while (false) {
-        std::vector<int> placed_on_sn(num_supernodes + 1, -1);
-        for (int i = 1; i <= num_supernodes; ++i) {
-            placed_on_sn[i] = current_res.placed_on.at(i);
-        }
-
-        std::cout << "\n=== Coarsen Level " << level+1 << ", node number: " << num_supernodes << "\n";
-
-        auto result = coarsen_one_level(
-            sn_graph, supernodes, num_supernodes,
-            placed_on_sn,
-            int(0.48 * FPGA_capacity));
-        int new_num = result.num_supernodes;
-        int reduction = num_supernodes - new_num;
-
-        std::cout << "  Coarsened: " << num_supernodes << " -> " << new_num
-                  << " (reduction=" << reduction << ")\n";
-
-        LevelData ld;
-        ld.sn_graph = sn_graph;
-        ld.supernodes = supernodes;
-        ld.num_supernodes = num_supernodes;
-        ld.sn_mapping = result.sn_mapping;
-        ld.net_mapping = result.net_mapping;
-        hierarchy.push_back(ld);
-
-        PartitionResult coarse_res = project_result_to_coarse(
-            sn_graph, num_supernodes,
-            result.sn_mapping, result.net_mapping,
-            current_res);
-
-        sn_graph = result.new_sn_graph;
-        supernodes = result.new_supernodes;
-        num_supernodes = new_num;
-        current_res = std::move(coarse_res);
-        level++;
-
-        if (reduction < stop_threshold) {
-            std::cout << "Stopping coarsening (reduction=" << reduction
-                      << " < threshold=" << stop_threshold << ").\n";
-            break;
-        }
-    }
-
-    {
-        int ff_c=0, comb_c=0;
-        std::vector<int> ff_w, comb_w;
-        for (int i = 1; i <= num_supernodes; i++) {
-            if (supernodes[i].is_ff) { ff_c++; ff_w.push_back(supernodes[i].weight); }
-            else { comb_c++; comb_w.push_back(supernodes[i].weight); }
-        }
-        std::sort(ff_w.rbegin(), ff_w.rend());
-        std::sort(comb_w.rbegin(), comb_w.rend());
-        std::cout << "\n--- Coarsest Supernodes Weight Distribution ---\n";
-        std::cout << "FF (" << ff_c << "), Comb (" << comb_c << ")\n";
-        std::cout << "FF top5: ";
-        for (int i = 0; i < std::min(5, (int)ff_w.size()); i++) std::cout << ff_w[i] << " ";
-        std::cout << "\nComb top5: ";
-        for (int i = 0; i < std::min(5, (int)comb_w.size()); i++) std::cout << comb_w[i] << " ";
-        std::cout << "\n";
-    }
-
-    std::cout << "\n==================================================\n";
-    std::cout << "STEP 3: Refinement on coarsest graph\n";
-    std::cout << "==================================================\n";
-    current_res = refine_partitioning(
-        sn_graph, supernodes, num_supernodes, graph, FPGA_capacity, current_res, 500);
-
-    std::clock_t end_time2 = std::clock();
-    double cpu_time_used2 = static_cast<double>(end_time2 - start_time) / CLOCKS_PER_SEC;
-    std::cout << "\nRunning time until refinement in the flat graph: " << cpu_time_used2 << " s\n";
-
-    std::exit(0); //For CODA-ML: remove this line and change line 1955 to while(true). Default is CODA-Flat.
-    
-    std::cout << "\n==================================================\n";
-    std::cout << "STEP 4: Uncoarsening Phase\n";
-    std::cout << "==================================================\n";
-
-    for (int lvl = (int)hierarchy.size() - 1; lvl >= 0; --lvl) {
-        const auto& fine_level = hierarchy[lvl];
-        const auto& mapping = fine_level.sn_mapping;
-        const std::vector<SuperNode>& coarse_sn =
-            (lvl == (int)hierarchy.size() - 1) ? supernodes : hierarchy[lvl + 1].supernodes;
-
-        PartitionResult next_res;
-        next_res.fpga_used_weight = current_res.fpga_used_weight;
-        next_res.d.assign(graph.n, std::vector<int>(graph.n, 0));
-
-        bool non_ff_valid = true;
-        for (int i = 1; i <= fine_level.num_supernodes; ++i) {
-            int p_u = mapping.at(i);
-            if (!coarse_sn[p_u].is_ff && fine_level.supernodes[i].is_ff) {
-                non_ff_valid = false;
-                std::cout << "  [Error] Non-FF coarse node " << p_u
-                          << " contains FF fine node " << i << "!\n";
-            }
-        }
-
-        for (int i = 1; i <= fine_level.num_supernodes; ++i) {
-            int p_u = mapping.at(i);
-            next_res.placed_on[i] = current_res.placed_on.at(p_u);
-        }
-
-        int correct_pair = 0, total_pair = 0, absorbed_pair = 0,
-            self_pair = 0, same_coarse_pair = 0;
-
-        for (const auto& pair : fine_level.sn_graph) {
-            int u = pair.first;
-            int p_u = mapping.at(u);
-            int fine_net_idx = 0;
-
-            for (const auto& net : pair.second) {
-                NetRoute nr;
-                nr.driver = u;
-                nr.weight = net.weight;
-                std::set<std::pair<int, int>> used_edges;
-
-                bool is_absorbed = (fine_level.net_mapping.count(u) == 0 ||
-                                    fine_level.net_mapping.at(u).count(fine_net_idx) == 0);
-
-                if (is_absorbed) {
-                    for (int v : net.sinks) {
-                        total_pair++;
-                        absorbed_pair++;
-                        nr.sinks.push_back(v);
-                        if (next_res.placed_on[u] != next_res.placed_on[v]) {
-                            std::cerr << "Error: Absorbed net driver " << u
-                                      << " and sink " << v
-                                      << " are not on the same FPGA!\n";
-                            exit(1);
-                        }
-                        nr.sink_paths[v] = {next_res.placed_on[u]};
-                    }
-                } else {
-                    int coarse_net_idx = fine_level.net_mapping.at(u).at(fine_net_idx);
-                    const NetRoute& coarse_nr = current_res.r_star.at(p_u)[coarse_net_idx];
-
-                    for (int v : net.sinks) {
-                        total_pair++;
-                        nr.sinks.push_back(v);
-                        if (u == v) {
-                            self_pair++;
-                            nr.sink_paths[v] = {next_res.placed_on[u]};
-                            continue;
-                        }
-                        int p_v = mapping.at(v);
-                        if (p_u == p_v) {
-                            same_coarse_pair++;
-                            if (next_res.placed_on[u] != next_res.placed_on[v]) {
-                                std::cerr << "Error: same-coarse mismatch\n";
-                                exit(1);
-                            }
-                            nr.sink_paths[v] = {next_res.placed_on[u]};
-                        } else {
-                            if (coarse_nr.sink_paths.count(p_v)) {
-                                const std::vector<int>& path = coarse_nr.sink_paths.at(p_v);
-                                if (!path.empty()) {
-                                    if (path.front() != current_res.placed_on.at(p_u)) {
-                                        std::cerr << "Error: path[0] mismatch\n";
-                                        exit(1);
-                                    }
-                                    if (path.back() != current_res.placed_on.at(p_v)) {
-                                        std::cerr << "Error: path[last] mismatch\n";
-                                        exit(1);
-                                    }
-                                    correct_pair++;
-                                }
-                                nr.sink_paths[v] = path;
-                                if (path.size() > 1) {
-                                    for (size_t k = 0; k + 1 < path.size(); ++k) {
-                                        used_edges.insert({std::min(path[k], path[k+1]),
-                                                           std::max(path[k], path[k+1])});
-                                    }
-                                }
-                            } else {
-                                std::cerr << "Error: Coarse sink " << p_v
-                                          << " not found in coarse route!\n";
-                                exit(1);
-                            }
-                        }
-                    }
-                }
-
-                for (const auto& edge : used_edges) {
-                    next_res.d[edge.first][edge.second] += net.weight;
-                    next_res.d[edge.second][edge.first] += net.weight;
-                }
-                next_res.r_star[u].push_back(nr);
-                fine_net_idx++;
-            }
-        }
-
-        std::cout << "  [Pair Stats] total=" << total_pair
-                  << " absorbed=" << absorbed_pair
-                  << " self=" << self_pair
-                  << " same_coarse=" << same_coarse_pair
-                  << " correct_cross=" << correct_pair
-                  << "\n";
-
-        bool d_match = true;
-        for (int i = 0; i < graph.n && d_match; ++i)
-            for (int j = 0; j < graph.n && d_match; ++j)
-                if (next_res.d[i][j] != current_res.d[i][j]) d_match = false;
-
-        current_res = next_res;
-
-        std::cout << "\n=== Uncoarsen to Level " << lvl << " ===\n";
-        std::cout << "Supernodes: " << fine_level.num_supernodes << "\n";
-        std::cout << "  [Check 1] " << (non_ff_valid ? "Passed" : "FAILED") << "\n";
-        std::cout << "  [Check 2] " << (d_match ? "Passed" : "FAILED")
-                  << " (d matches coarse level)\n";
-
-        if ((hierarchy.size() - lvl) % 10 != 0 && lvl != 0) continue;
-        std::cout << "\n--- Running Refinement on Level " << lvl << " ---\n";
-        current_res = refine_partitioning(
-            fine_level.sn_graph, fine_level.supernodes, fine_level.num_supernodes,
-            graph, FPGA_capacity, current_res, 100);
-    }
+    std::clock_t end_time = std::clock();
+    double cpu_time_used = static_cast<double>(end_time - start_time) / CLOCKS_PER_SEC;
+    std::cout << "\nRunning time: " << cpu_time_used << " s\n";
 
     std::cout << "\n=== Final Critical Path Delay ===\n";
     compute_critical_path_delay(
-        hierarchy[0].sn_graph, hierarchy[0].supernodes,
-        hierarchy[0].num_supernodes, current_res);
+        sn_graph, supernodes, num_supernodes, current_res);
 
     std::cout << "\n=== Final FPGA Interconnect Usage (res.d non-zero entries) ===\n";
     long long total_consumption = 0;
@@ -2194,36 +1669,5 @@ int main(int argc, char* argv[]) {
         std::cout << "FPGA " << f << ": " << current_res.fpga_used_weight[f]
                   << " / " << FPGA_capacity << "\n";
     }
-
-    std::string out_file = "./dataset/titan23/" + name + "/" + name + "_output.txt";
-    std::ofstream fout(out_file);
-    if (!fout) { std::cerr << "Cannot open " << out_file << "\n"; return 1; }
-
-    fout << "PLACEMENT " << hg.n << "\n";
-    for (int i = 1; i <= hg.n; i++) {
-        fout << i << " " << current_res.placed_on.at(i) << "\n";
-    }
-    int total_nets = 0;
-    for (const auto& u_pair : current_res.r_star) total_nets += u_pair.second.size();
-    fout << "ROUTING " << total_nets << "\n";
-    for (const auto& u_pair : current_res.r_star) {
-        int drv = u_pair.first;
-        for (int ni = 0; ni < (int)u_pair.second.size(); ni++) {
-            const auto& nr = u_pair.second[ni];
-            fout << drv << " " << ni << " " << nr.sinks.size() << " " << nr.weight << "\n";
-            for (int sink : nr.sinks) {
-                const auto& path = nr.sink_paths.at(sink);
-                fout << "  " << sink << " " << path.size();
-                for (int f : path) fout << " " << f;
-                fout << "\n";
-            }
-        }
-    }
-    fout.close();
-    std::cout << "Result saved to " << out_file << "\n";
-
-    std::clock_t end_time = std::clock();
-    double cpu_time_used = static_cast<double>(end_time - start_time) / CLOCKS_PER_SEC;
-    std::cout << "\nRunning time: " << cpu_time_used << " s\n";
     return 0;
 }
